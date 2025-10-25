@@ -1,0 +1,9 @@
+# Variables de entorno para Railway
+# Configura estas en el dashboard de Railway
+
+NEXT_PUBLIC_SUPABASE_URL=tu_url_de_supabase_aqui
+NEXT_PUBLIC_SUPABASE_ANON_KEY=tu_anon_key_aqui
+NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY=tu_service_role_key_aqui
+
+NODE_ENV=production
+NEXT_TELEMETRY_DISABLED=1
