@@ -1,0 +1,554 @@
+// ============================================================================
+// EXAMPLE: Notification Processing Webhook with Idempotency
+// ============================================================================
+// This example shows how to implement idempotent notification processing
+// Location: app/api/notifications/process/route.ts
+// 
+// Features:
+// - QStash signature verification
+// - Idempotency key support (prevent duplicate sends)
+// - Multiple channel support (email, SMS, push)
+// - Error logging to Dead Letter Queue
+// - Sentry monitoring
+// ============================================================================
+
+import { createServerClient } from "@/lib/supabase/server"
+import { verifySignatureAppRouter } from "@upstash/qstash/dist/nextjs"
+import { captureException, captureMessage } from "@sentry/nextjs"
+import { z } from "zod"
+
+// ============================================================================
+// TYPE DEFINITIONS
+// ============================================================================
+
+interface NotificationPayload {
+  id: string
+  user_id: string
+  type: string
+  channel: "email" | "sms" | "push"
+  subject: string
+  message: string
+  appointment_id?: string
+  queue_ticket_id?: string
+  created_at: string
+}
+
+interface WebhookPayload {
+  notificationId: string
+  userId: string
+  type: string
+  channel: "email" | "sms" | "push"
+  subject: string
+  message: string
+  appointmentId?: string
+  queueTicketId?: string
+  idempotencyKey?: string
+}
+
+// ============================================================================
+// VALIDATION SCHEMA
+// ============================================================================
+
+const WebhookPayloadSchema = z.object({
+  notificationId: z.string().uuid("Invalid notification ID"),
+  userId: z.string().uuid("Invalid user ID"),
+  type: z.string(),
+  channel: z.enum(["email", "sms", "push"]),
+  subject: z.string().min(1, "Subject required"),
+  message: z.string().min(1, "Message required"),
+  appointmentId: z.string().uuid().optional(),
+  queueTicketId: z.string().uuid().optional(),
+  idempotencyKey: z.string().optional(),
+})
+
+type WebhookInput = z.infer<typeof WebhookPayloadSchema>
+
+// ============================================================================
+// EMAIL SENDER EXAMPLES (implement with your provider)
+// ============================================================================
+
+async function sendEmail(to: string, subject: string, html: string): Promise<boolean> {
+  try {
+    // EXAMPLE: Using Resend
+    // const { data, error } = await resend.emails.send({
+    //   from: 'notifications@citaverde.com',
+    //   to: to,
+    //   subject: subject,
+    //   html: html,
+    // })
+    // return !error
+
+    // EXAMPLE: Using SendGrid
+    // const msg = {
+    //   to: to,
+    //   from: 'notifications@citaverde.com',
+    //   subject: subject,
+    //   html: html,
+    // }
+    // await sgMail.send(msg)
+    // return true
+
+    // EXAMPLE: Using Mailgun
+    // const response = await mailgun.messages().send({
+    //   from: 'notifications@citaverde.com',
+    //   to: to,
+    //   subject: subject,
+    //   html: html,
+    // })
+    // return !!response.id
+
+    console.log(`Email sent to ${to}: ${subject}`)
+    return true
+  } catch (error) {
+    console.error("Email send failed:", error)
+    captureException(error, { tags: { channel: "email" } })
+    return false
+  }
+}
+
+async function sendSMS(to: string, message: string): Promise<boolean> {
+  try {
+    // EXAMPLE: Using Twilio
+    // const response = await twilio.messages.create({
+    //   from: process.env.TWILIO_PHONE_NUMBER,
+    //   to: to,
+    //   body: message,
+    // })
+    // return !!response.sid
+
+    console.log(`SMS sent to ${to}: ${message}`)
+    return true
+  } catch (error) {
+    console.error("SMS send failed:", error)
+    captureException(error, { tags: { channel: "sms" } })
+    return false
+  }
+}
+
+async function sendPush(userId: string, title: string, body: string): Promise<boolean> {
+  try {
+    // EXAMPLE: Using Firebase Cloud Messaging
+    // const message = {
+    //   notification: { title, body },
+    //   tokens: [userToken], // fetch from DB
+    // }
+    // const response = await admin.messaging().sendMulticast(message)
+    // return response.successCount > 0
+
+    console.log(`Push sent to user ${userId}: ${title}`)
+    return true
+  } catch (error) {
+    console.error("Push send failed:", error)
+    captureException(error, { tags: { channel: "push" } })
+    return false
+  }
+}
+
+// ============================================================================
+// IDEMPOTENCY: Check if notification already processed
+// ============================================================================
+
+async function checkIdempotency(
+  notificationId: string,
+  idempotencyKey: string | undefined,
+  supabase: any
+): Promise<{ processed: boolean; result?: any }> {
+  // If no explicit idempotency key, use notification ID
+  const key = idempotencyKey || `notif:${notificationId}`
+
+  // Check if this key was already processed
+  const { data: existingRecord } = await supabase
+    .from("notification_idempotency")
+    .select("*")
+    .eq("idempotency_key", key)
+    .single()
+
+  if (existingRecord) {
+    // Already processed - return cached result
+    console.log(`Idempotency check: Already processed (key: ${key})`)
+    return {
+      processed: true,
+      result: existingRecord.response_payload,
+    }
+  }
+
+  return { processed: false }
+}
+
+// ============================================================================
+// IDEMPOTENCY: Log successful delivery
+// ============================================================================
+
+async function logDelivery(
+  notificationId: string,
+  idempotencyKey: string | undefined,
+  response: any,
+  supabase: any
+): Promise<void> {
+  const key = idempotencyKey || `notif:${notificationId}`
+
+  try {
+    // Use database function for atomic logging
+    await supabase.rpc("log_notification_delivery", {
+      p_notification_id: notificationId,
+      p_idempotency_key: key,
+      p_response_payload: response,
+    })
+
+    console.log(`Delivery logged (key: ${key})`)
+  } catch (error) {
+    // If logging fails, still mark as sent
+    // We'll log the error but not fail the request
+    console.error("Failed to log delivery:", error)
+    captureException(error, { tags: { operation: "log_delivery" } })
+
+    // Fallback: Update notification status directly
+    await supabase
+      .from("notifications")
+      .update({
+        status: "sent",
+        delivered_at: new Date().toISOString(),
+      })
+      .eq("id", notificationId)
+  }
+}
+
+// ============================================================================
+// SEND NOTIFICATION (delegates to appropriate channel)
+// ============================================================================
+
+async function sendNotification(
+  payload: WebhookInput,
+  supabase: any
+): Promise<{
+  success: boolean
+  channel: string
+  message?: string
+  error?: string
+}> {
+  // Get user email/phone
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("email, phone, full_name")
+    .eq("id", payload.userId)
+    .single()
+
+  if (!profile) {
+    throw new Error(`Profile not found for user ${payload.userId}`)
+  }
+
+  switch (payload.channel) {
+    case "email": {
+      if (!profile.email) {
+        throw new Error(`No email for user ${payload.userId}`)
+      }
+
+      const success = await sendEmail(
+        profile.email,
+        payload.subject,
+        `<h2>${payload.subject}</h2><p>${payload.message}</p>`
+      )
+
+      return {
+        success,
+        channel: "email",
+        message: success ? "Email sent" : "Email failed",
+      }
+    }
+
+    case "sms": {
+      if (!profile.phone) {
+        throw new Error(`No phone for user ${payload.userId}`)
+      }
+
+      const success = await sendSMS(profile.phone, payload.message)
+
+      return {
+        success,
+        channel: "sms",
+        message: success ? "SMS sent" : "SMS failed",
+      }
+    }
+
+    case "push": {
+      const success = await sendPush(payload.userId, payload.subject, payload.message)
+
+      return {
+        success,
+        channel: "push",
+        message: success ? "Push sent" : "Push failed",
+      }
+    }
+
+    default:
+      throw new Error(`Unknown channel: ${payload.channel}`)
+  }
+}
+
+// ============================================================================
+// DEAD LETTER QUEUE: Log failed notifications
+// ============================================================================
+
+async function logToDeadLetterQueue(
+  notificationId: string,
+  payload: WebhookInput,
+  error: string,
+  supabase: any
+): Promise<void> {
+  try {
+    await supabase.from("notification_dead_letter_queue").insert({
+      notification_id: notificationId,
+      original_payload: payload,
+      error_message: error,
+      status: "failed",
+      retries: 0,
+    })
+
+    console.log(`Logged to DLQ: ${notificationId}`)
+  } catch (dlqError) {
+    console.error("Failed to log to DLQ:", dlqError)
+    captureException(dlqError, { tags: { operation: "dlq_logging" } })
+  }
+}
+
+// ============================================================================
+// MAIN WEBHOOK HANDLER
+// ============================================================================
+
+export const POST = verifySignatureAppRouter(async (request) => {
+  const startTime = Date.now()
+
+  try {
+    // ====================================================================
+    // 1. PARSE AND VALIDATE REQUEST
+    // ====================================================================
+
+    const body = await request.json()
+
+    console.log("Webhook received:", {
+      notificationId: body.notificationId,
+      channel: body.channel,
+      timestamp: new Date().toISOString(),
+    })
+
+    // Validate payload structure
+    let payload: WebhookInput
+    try {
+      payload = WebhookPayloadSchema.parse(body)
+    } catch (error) {
+      console.error("Invalid payload:", error)
+      captureMessage("Invalid webhook payload", { level: "error", extra: { body } })
+
+      return new Response(
+        JSON.stringify({
+          error: "Invalid payload",
+          details: error instanceof z.ZodError ? error.issues : undefined,
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      )
+    }
+
+    // ====================================================================
+    // 2. CHECK IDEMPOTENCY (prevent duplicate sends)
+    // ====================================================================
+
+    const supabase = await createServerClient()
+
+    const idempotencyCheck = await checkIdempotency(
+      payload.notificationId,
+      payload.idempotencyKey,
+      supabase
+    )
+
+    if (idempotencyCheck.processed) {
+      console.log("Notification already processed (idempotent)")
+
+      // Return 200 to prevent QStash from retrying
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "Notification already processed (idempotent)",
+          processingTimeMs: Date.now() - startTime,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    }
+
+    // ====================================================================
+    // 3. SEND NOTIFICATION
+    // ====================================================================
+
+    const result = await sendNotification(payload, supabase)
+
+    if (!result.success) {
+      throw new Error(`Failed to send ${payload.channel} notification: ${result.error}`)
+    }
+
+    console.log(`Notification sent successfully: ${payload.channel}`)
+
+    // ====================================================================
+    // 4. LOG SUCCESSFUL DELIVERY (idempotently)
+    // ====================================================================
+
+    const response = {
+      success: true,
+      channel: result.channel,
+      sentAt: new Date().toISOString(),
+      processingTimeMs: Date.now() - startTime,
+    }
+
+    await logDelivery(payload.notificationId, payload.idempotencyKey, response, supabase)
+
+    // ====================================================================
+    // 5. RETURN SUCCESS RESPONSE
+    // ====================================================================
+
+    captureMessage("Notification delivered successfully", {
+      level: "info",
+      extra: {
+        notificationId: payload.notificationId,
+        channel: payload.channel,
+        userId: payload.userId,
+      },
+    })
+
+    return new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+  } catch (error) {
+    const processingTime = Date.now() - startTime
+
+    console.error("Webhook error:", error)
+
+    const errorMessage = error instanceof Error ? error.message : "Unknown error"
+
+    // Try to get notification ID for logging
+    const body = await request.json().catch(() => ({}))
+    const notificationId = body.notificationId
+
+    // Log to DLQ if we have notification ID
+    if (notificationId) {
+      const supabase = await createServerClient()
+      await logToDeadLetterQueue(notificationId, body, errorMessage, supabase)
+    }
+
+    // Report to Sentry
+    captureException(error, {
+      tags: {
+        component: "notification_webhook",
+        processingTimeMs: processingTime.toString(),
+      },
+      extra: {
+        notificationId,
+        payload: body,
+      },
+    })
+
+    // Return 500 (will trigger QStash retry)
+    // Or return 400 if validation failed (won't retry)
+    // We return 500 here so QStash will retry the webhook
+    return new Response(
+      JSON.stringify({
+        error: errorMessage,
+        processingTimeMs: processingTime,
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    )
+  }
+})
+
+// ============================================================================
+// IMPLEMENTATION NOTES
+// ============================================================================
+
+/*
+HOW THIS WEBHOOK IMPLEMENTS IDEMPOTENCY:
+
+1. REQUEST ARRIVES
+   - QStash sends webhook with payload
+   - Example: { notificationId: "123", channel: "email", ... }
+
+2. IDEMPOTENCY CHECK
+   - Look in notification_idempotency table for idempotency_key
+   - If found: Return success immediately (don't send again)
+   - If not found: Continue to step 3
+
+3. SEND NOTIFICATION
+   - Call email/SMS/push provider API
+   - If successful, go to step 4
+   - If failed, go to step 5
+
+4. LOG SUCCESSFUL DELIVERY
+   - Insert into notification_idempotency table with idempotency_key
+   - Update notifications.status = "sent"
+   - Return 200 to QStash (no more retries)
+
+5. LOG FAILED DELIVERY
+   - Insert into notification_dead_letter_queue
+   - Return 500 to QStash (will retry up to 3 times)
+   - After all retries exhausted, stays in DLQ
+
+DUPLICATE PREVENTION:
+
+Scenario: Network hiccup causes QStash to send webhook twice
+
+Timeline:
+  10:00:00 - QStash sends webhook
+  10:00:05 - Our endpoint processes, sends email, logs to idempotency table
+  10:00:10 - Network timeout, QStash doesn't get 200 response
+  10:00:15 - QStash retries (sends webhook again)
+  10:00:20 - Our endpoint receives duplicate
+    → Checks idempotency table
+    → Finds previous record
+    → Returns 200 immediately
+    → Email NOT sent second time ✓
+
+Result: Only 1 email sent despite 2 webhook calls
+
+QSTASH RETRY LOGIC:
+
+QStash retries based on response status:
+  200-299: Success, no more retries
+  400: Invalid request, don't retry
+  500: Server error, retry (up to 3 times)
+
+Our endpoint returns:
+  200: On success OR idempotent re-request
+  500: On delivery failure (will retry)
+
+TESTING:
+
+1. Test successful delivery:
+   curl -X POST http://localhost:3000/api/notifications/process \
+     -H "Authorization: Bearer YOUR_QSTASH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "notificationId": "550e8400-e29b-41d4-a716-446655440000",
+       "userId": "550e8400-e29b-41d4-a716-446655440001",
+       "type": "appointment_confirmation",
+       "channel": "email",
+       "subject": "Your Appointment",
+       "message": "Your appointment is confirmed"
+     }'
+
+2. Test idempotency (send same request twice):
+   - First request: Sends email, returns 200
+   - Second request: Checks idempotency, returns 200 (no email)
+
+3. Test failed delivery:
+   - Break email provider credentials
+   - Webhook will return 500
+   - QStash will retry 3 times
+   - After 3 retries, logs to DLQ
+   - Admin can manually retry or investigate
+
+4. Check DLQ:
+   SELECT * FROM notification_dead_letter_queue WHERE status = 'failed';
+
+5. Retry a failed notification:
+   UPDATE notification_dead_letter_queue
+   SET status = 'pending'
+   WHERE id = 'dlq-id';
+   -- QStash will pick it up on next job
+*/
