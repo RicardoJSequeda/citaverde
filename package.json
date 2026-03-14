@@ -7,7 +7,7 @@
     "dev": "next dev",
     "lint": "eslint .",
     "start": "next start",
-    "test": "jest"
+    "test": "next test"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -85,6 +85,7 @@
     "jest-environment-jsdom": "^30.3.0",
     "postcss": "^8.5",
     "tailwindcss": "^4.1.9",
+    "ts-jest": "^29.4.6",
     "tw-animate-css": "1.3.3",
     "typescript": "^5"
   }
